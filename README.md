@@ -144,5 +144,4 @@ Detalhamento completo em [`docs/decisoes-arquiteturais.md`](docs/decisoes-arquit
 └── docs/
     └── decisoes-arquiteturais.md
 ```
-#   s a g a - p a t t e r n - b l u e p r i n t  
- 
+#
