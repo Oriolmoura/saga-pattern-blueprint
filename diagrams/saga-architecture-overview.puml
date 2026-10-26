@@ -1,0 +1,81 @@
+@startuml saga-architecture-overview
+title Saga Orquestrada – Visão Geral da Arquitetura (Order · Inventory · Payment)
+left to right direction
+skinparam shadowing false
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 12
+skinparam roundCorner 8
+skinparam ArrowColor #444444
+skinparam component {
+  BackgroundColor #EAF2FB
+  BorderColor #2F5D8C
+}
+skinparam database {
+  BackgroundColor #FFF6D6
+  BorderColor #A68A1F
+}
+skinparam queue {
+  BackgroundColor #E6F4EA
+  BorderColor #2E7D32
+}
+
+actor "Cliente" as C
+component "API Gateway\n(authN/authZ, rate limit)" as GW
+
+package "Order Domain" {
+  component "Order Service" as OS
+  database "orders_db\norders · outbox\nprocessed_messages" as ODB
+}
+
+package "Saga Orchestrator" #F3EAF8 {
+  component "Order Saga Orchestrator\n(máquina de estados)" as ORC
+  component "Timeout Watcher\n(scheduler)" as TW
+  database "saga_db\nsaga_instance · saga_step\noutbox · processed_messages" as SDB
+}
+
+package "Inventory Domain" {
+  component "Inventory Service" as IS
+  database "inventory_db\nstock · reservation\noutbox · processed_messages" as IDB
+}
+
+package "Payment Domain" {
+  component "Payment Service" as PS
+  database "payment_db\npayment · outbox\nprocessed_messages" as PDB
+}
+
+queue "Message Broker (Kafka / RabbitMQ)\nchave de partição = saga_id\nentrega at-least-once" as MB
+queue "Dead-Letter Queues\n<tópico>.dlq" as DLQ
+cloud "Gateway de Pagamento\n(externo)" as PG
+
+C --> GW : POST /orders\nIdempotency-Key
+GW --> OS : HTTPS (síncrono)
+
+OS --> ODB : TX local:\npedido PENDING + outbox
+IS --> IDB : TX local
+PS --> PDB : TX local
+ORC --> SDB : TX local:\nestado + outbox
+TW --> SDB : varre deadlines\n(SKIP LOCKED)
+TW ..> ORC : dispara retry /\ncompensação
+
+OS ..> MB : «event» OrderCreated\n(Outbox relay)
+MB ..> ORC : OrderCreated +\nreplies (saga.replies)
+ORC ..> MB : «command» ReserveStock · ProcessPayment\nApproveOrder · ReleaseStock · CancelOrder
+MB ..> IS : inventory.commands
+IS ..> MB : saga.replies
+MB ..> PS : payment.commands
+PS ..> MB : saga.replies
+MB ..> OS : order.commands
+OS ..> MB : saga.replies
+
+PS --> PG : HTTPS + Idempotency-Key\nCircuit Breaker · Timeout · Retry
+MB ..> DLQ : após N tentativas /\nerro permanente
+
+legend right
+  <b>Legenda</b>
+  ──►  síncrono (HTTP / TX local)
+  ┈┈►  assíncrono (mensageria)
+  Database-per-service
+  Escrita no DB + publicação = Transactional Outbox
+  Consumo = Idempotent Consumer (processed_messages)
+endlegend
+@enduml

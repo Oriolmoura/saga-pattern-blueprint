@@ -1,0 +1,55 @@
+@startuml sequence-compensation-flow
+title Saga Orquestrada – Falha e Compensação (pagamento recusado após reserva de estoque)
+skinparam shadowing false
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 14
+autonumber "<b>[00]"
+
+actor Cliente as C
+participant "Order\nService" as OS #EAF2FB
+participant "Saga\nOrchestrator" as ORC #F3EAF8
+participant "Inventory\nService" as IS #E6F4EA
+participant "Payment\nService" as PS #FFF6D6
+participant "Gateway de\nPagamento (ext.)" as PG #EEEEEE
+
+== Passos já concluídos (idênticos ao fluxo de sucesso) ==
+C -> OS : POST /orders (Idempotency-Key K1)
+OS --> C : 202 Accepted {orderId, PENDING}
+OS ->> ORC : «event» OrderCreated
+ORC ->> IS : «command» ReserveStock
+IS -> IS : TX local: reservation = RESERVED (estoque retido)
+IS ->> ORC : «reply» StockReserved
+
+== T3 – Transação que FALHA ==
+ORC -> ORC : TX local: estado → PAYMENT_PROCESSING
+ORC ->> PS : «command» ProcessPayment {paymentId}
+PS -> PG : POST /charges (Idempotency-Key = paymentId)
+PG --> PS : 402 DECLINED {reason = INSUFFICIENT_FUNDS}
+PS -> PS : TX local: payment → REJECTED (nada foi cobrado)\n+ outbox(PaymentRejected)
+PS ->> ORC : «reply» PaymentRejected {reason}
+
+== Compensação (ordem inversa à execução) ==
+ORC -> ORC : TX local: estado → <b>COMPENSATING</b> (registra causa = PAYMENT_REJECTED)\n+ outbox(ReleaseStock)
+ORC ->> IS : «command» <b>ReleaseStock</b> {saga_id, reservationId}   <i>[compensa T2]</i>
+IS -> IS : TX local: dedup + reservation → RELEASED\n+ estoque disponível (+ qtd) + outbox(StockReleased)
+IS ->> ORC : «reply» StockReleased
+
+ORC -> ORC : TX local: estado → CANCELLING_ORDER + outbox(CancelOrder)
+ORC ->> OS : «command» <b>CancelOrder</b> {orderId, reason}   <i>[compensa T1]</i>
+OS -> OS : TX local: dedup + order → CANCELLED (motivo = PAYMENT_REJECTED)\n+ outbox(OrderCancelled)
+OS ->> ORC : «reply» OrderCancelled
+
+ORC -> ORC : TX local: estado → <b>COMPENSATED</b> (saga encerrada)
+
+C -> OS : GET /orders/{id}  (ou webhook/notificação)
+OS --> C : 200 {status = CANCELLED, reason = PAYMENT_REJECTED}
+
+note over ORC, PG
+  <b>Propriedades garantidas</b>
+  • Compensações são idempotentes e retentáveis até sucesso (não existe "falha de compensação" sem retry → DLQ + alerta).
+  • T3 (pagamento) é a transação-pivô: recusa definitiva = nada a estornar; só há <i>RefundPayment</i> no cenário de aprovação tardia (ver sequence-timeout-recovery).
+  • ReleaseStock antes de ReserveStock (reordenação/atraso) grava tombstone → reserva tardia é rejeitada.
+end note
+@enduml

@@ -1,0 +1,47 @@
+@startuml sequence-timeout-recovery
+title Timeout de Rede no Pagamento (resultado ambíguo) – Retry, Reconciliação e Estorno Tardio
+skinparam shadowing false
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 14
+autonumber "<b>[00]"
+
+participant "Timeout\nWatcher" as TW #EEEEEE
+participant "Saga\nOrchestrator" as ORC #F3EAF8
+participant "Inventory\nService" as IS #E6F4EA
+participant "Payment\nService" as PS #FFF6D6
+participant "Gateway de\nPagamento (ext.)" as PG #EEEEEE
+
+ORC ->> PS : «command» ProcessPayment {paymentId}  (saga_step.deadline = now + 30s)
+PS -> PG : POST /charges (Idempotency-Key = paymentId)
+PG -[#red]x PS : <font color=red>read timeout (sem resposta)</font>
+PS -> PS : payment → UNKNOWN (não é recusa; <b>não</b> responde PaymentRejected)
+PS -> PG : retry c/ backoff exponencial + jitter\n(mesma Idempotency-Key → sem cobrança dupla)
+PG -[#red]x PS : <font color=red>timeout / circuito ABERTO</font>
+
+TW -> ORC : saga_step vencido (deadline < now) – SELECT … FOR UPDATE SKIP LOCKED
+ORC ->> PS : «command» GetPaymentStatus {paymentId}  (tentativa 2/5)
+
+alt Gateway confirma APPROVED na consulta
+  PS -> PG : GET /charges?idempotency_key=paymentId
+  PG --> PS : APPROVED
+  PS ->> ORC : «reply» PaymentApproved → saga segue o fluxo de sucesso
+else Gateway confirma DECLINED / charge inexistente
+  PS ->> ORC : «reply» PaymentRejected → saga segue compensação (ReleaseStock, CancelOrder)
+else Esgotou tentativas (5) sem resposta conclusiva
+  ORC -> ORC : estado → PAYMENT_UNKNOWN (reserva mantida até expires_at)\n+ alerta + job de reconciliação periódico
+  ORC ->> IS : «command» ReleaseStock (ao expirar TTL / decisão operacional)
+  IS ->> ORC : «reply» StockReleased
+  ORC -> ORC : estado → CANCELLING_ORDER → COMPENSATED (CancelOrder)
+  ...mais tarde, reconciliação detecta cobrança APPROVED no gateway...
+  PS -> PS : payment recebe aprovação tardia com saga já COMPENSATED
+  PS -> PG : POST /refunds {chargeId}  <i>[compensação do pivô]</i>
+  PS ->> ORC : «event» PaymentRefunded {saga_id} (auditoria)
+end
+
+note over ORC, PS
+  Regra-chave: <b>timeout ≠ recusa</b>. Compensar às cegas após timeout pode estornar estoque de um pedido já pago.
+  Só se compensa após resposta conclusiva ou após esgotar a política de reconciliação, e com estorno automático como rede de segurança.
+end note
+@enduml

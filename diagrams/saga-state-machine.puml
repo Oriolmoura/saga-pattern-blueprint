@@ -1,0 +1,37 @@
+@startuml saga-state-machine
+title Máquina de Estados da Saga (tabela saga_instance)
+skinparam shadowing false
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 12
+skinparam state {
+  BackgroundColor #EAF2FB
+  BorderColor #2F5D8C
+}
+hide empty description
+
+[*] --> STOCK_RESERVING : OrderCreated / envia ReserveStock
+STOCK_RESERVING --> PAYMENT_PROCESSING : StockReserved / envia ProcessPayment
+STOCK_RESERVING --> CANCELLING_ORDER : StockRejected (sem estoque) / envia CancelOrder
+STOCK_RESERVING --> COMPENSATING_STOCK : timeout esgotado / envia ReleaseStock (segurança)
+
+PAYMENT_PROCESSING --> ORDER_APPROVING : PaymentApproved / envia ApproveOrder + ConfirmStock\n<b>(ponto de não retorno – pivô)</b>
+PAYMENT_PROCESSING --> COMPENSATING_STOCK : PaymentRejected / envia ReleaseStock
+PAYMENT_PROCESSING --> PAYMENT_UNKNOWN : timeout esgotado
+
+PAYMENT_UNKNOWN --> ORDER_APPROVING : reconciliação = APPROVED
+PAYMENT_UNKNOWN --> COMPENSATING_STOCK : reconciliação = DECLINED / TTL expirou
+
+COMPENSATING_STOCK --> CANCELLING_ORDER : StockReleased / envia CancelOrder
+CANCELLING_ORDER --> COMPENSATED : OrderCancelled
+
+ORDER_APPROVING --> COMPLETED : OrderApproved + StockConfirmed
+
+COMPLETED --> [*]
+COMPENSATED --> [*]
+
+state "FAILED_MANUAL\n(DLQ + intervenção)" as FM
+COMPENSATING_STOCK --> FM : retries esgotados
+CANCELLING_ORDER --> FM : retries esgotados
+ORDER_APPROVING --> FM : retries esgotados
+FM --> [*]
+@enduml

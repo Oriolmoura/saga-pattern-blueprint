@@ -1,0 +1,77 @@
+@startuml sequence-success-flow
+title Saga Orquestrada – Fluxo de Sucesso (Happy Path)
+skinparam shadowing false
+skinparam defaultFontName DejaVu Sans
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 14
+skinparam BoxPadding 6
+autonumber "<b>[00]"
+
+actor Cliente as C
+participant "API Gateway" as GW
+participant "Order\nService" as OS #EAF2FB
+participant "Saga\nOrchestrator" as ORC #F3EAF8
+participant "Inventory\nService" as IS #E6F4EA
+participant "Payment\nService" as PS #FFF6D6
+participant "Gateway de\nPagamento (ext.)" as PG #EEEEEE
+
+C -> GW : POST /orders {itens, pagamento}\nIdempotency-Key: K1
+GW -> OS : POST /orders
+activate OS
+OS -> OS : <b>TX local</b>: INSERT order(status=PENDING)\n+ INSERT outbox(OrderCreated)
+OS --> GW : 202 Accepted {orderId, status=PENDING}
+GW --> C : 202 Accepted (acompanhar via GET /orders/{id})
+OS ->> ORC : «event» OrderCreated {orderId, saga_id}\n(Outbox relay → broker)
+deactivate OS
+
+activate ORC
+ORC -> ORC : <b>TX local</b>: INSERT saga_instance(STARTED→STOCK_RESERVING)\n+ saga_step(deadline) + outbox(ReserveStock)
+ORC ->> IS : «command» ReserveStock {saga_id, orderId, itens, ttl=15min}
+deactivate ORC
+
+activate IS
+IS -> IS : <b>TX local</b>: dedup(message_id) + UPDATE stock (disponível − qtd)\n+ INSERT reservation(RESERVED, expires_at) + outbox(StockReserved)
+IS ->> ORC : «reply» StockReserved {reservationId}
+deactivate IS
+
+activate ORC
+ORC -> ORC : <b>TX local</b>: estado → PAYMENT_PROCESSING\n+ outbox(ProcessPayment)
+ORC ->> PS : «command» ProcessPayment {saga_id, valor, paymentId}
+deactivate ORC
+
+activate PS
+PS -> PS : dedup(message_id); INSERT payment(PENDING)
+PS -> PG : POST /charges  (Idempotency-Key = paymentId)\n[Timeout · Retry · Circuit Breaker]
+PG --> PS : 200 APPROVED {chargeId}
+PS -> PS : <b>TX local</b>: payment → APPROVED + outbox(PaymentApproved)
+PS ->> ORC : «reply» PaymentApproved {chargeId}
+deactivate PS
+
+activate ORC
+ORC -> ORC : <b>TX local</b>: estado → ORDER_APPROVING (pivot cruzado)\n+ outbox(ApproveOrder, ConfirmStock)
+ORC ->> OS : «command» ApproveOrder {orderId}
+ORC ->> IS : «command» ConfirmStock {reservationId}
+deactivate ORC
+
+activate OS
+OS -> OS : <b>TX local</b>: order → APPROVED + outbox(OrderApproved)
+OS ->> ORC : «reply» OrderApproved
+deactivate OS
+activate IS
+IS -> IS : <b>TX local</b>: reservation → CONFIRMED (baixa definitiva)
+IS ->> ORC : «reply» StockConfirmed
+deactivate IS
+
+activate ORC
+ORC -> ORC : <b>TX local</b>: estado → <b>COMPLETED</b>
+deactivate ORC
+
+note over C, PG
+  <b>Notas</b>
+  • "→" = síncrono (HTTP) · "→>" = assíncrono via broker (at-least-once), chave de partição = saga_id.
+  • Toda mudança de estado + publicação ocorre numa única transação local (Transactional Outbox) – sem dual-write.
+  • Todo consumidor é idempotente (tabela processed_messages na mesma TX do efeito de negócio).
+  • Cliente observa o resultado final por polling em GET /orders/{id} ou webhook (consistência eventual).
+end note
+@enduml
